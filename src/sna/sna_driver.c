@@ -308,7 +308,7 @@ static void sna_dpms_set(ScrnInfoPtr scrn, int mode, int flags)
 	 * back on.
 	 */
 	if (mode != DPMSModeOn) {
-		if (sna->mode.hidden == 0) {
+		if (sna->mode.hidden == 0 && !(sna->flags & SNA_NO_DPMS)) {
 			DBG(("%s: hiding %d outputs\n",
 			     __FUNCTION__, config->num_output));
 			for (i = 0; i < config->num_output; i++) {
@@ -796,8 +796,13 @@ sna_handle_uevents(int fd, void *closure)
 			const char *str;
 
 			str = udev_device_get_property_value(dev, "HOTPLUG");
-			if (str && atoi(str) == 1)
-				hotplug = true;
+			if (str && atoi(str) == 1) {
+				str = udev_device_get_property_value(dev, "CONNECTOR");
+				if (str)
+					hotplug |= sna_mode_find_hotplug_connector(sna, atoi(str));
+				else
+					hotplug = true;
+			}
 		}
 
 		udev_device_unref(dev);
@@ -1204,6 +1209,8 @@ sna_screen_init(SCREEN_INIT_ARGS_DECL)
 				 CMAP_PALETTED_TRUECOLOR))
 		return FALSE;
 
+	if (!xf86CheckBoolOption(scrn->options, "dpms", TRUE))
+		sna->flags |= SNA_NO_DPMS;
 	xf86DPMSInit(screen, sna_dpms_set, 0);
 
 	sna_uevent_init(sna);

@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <ctype.h>
+#include <dirent.h>
 
 #if HAVE_ALLOCA_H
 #include <alloca.h>
@@ -253,6 +254,8 @@ struct sna_output {
 
 	unsigned int is_panel : 1;
 	unsigned int add_default_modes : 1;
+	int connector_type;
+	int connector_type_id;
 
 	uint32_t edid_idx;
 	uint32_t edid_blob_id;
@@ -272,7 +275,9 @@ struct sna_output {
 
 	uint32_t last_detect;
 	uint32_t status;
+	unsigned int hotplug_count;
 	bool update_properties;
+	bool reprobe;
 
 	int num_modes;
 	struct drm_mode_modeinfo *modes;
@@ -561,6 +566,15 @@ static void assert_scanout(struct kgem *kgem, struct kgem_bo *bo,
 #else
 #define assert_scanout(k, b, w, h)
 #endif
+
+static void assert_crtc_fb(struct sna *sna, struct sna_crtc *crtc)
+{
+#ifndef NDEBUG
+	struct drm_mode_crtc mode = { .crtc_id = __sna_crtc_id(crtc) };
+	drmIoctl(sna->kgem.fd, DRM_IOCTL_MODE_GETCRTC, &mode);
+	assert(mode.fb_id == fb_id(crtc->bo));
+#endif
+}
 
 static unsigned get_fb(struct sna *sna, struct kgem_bo *bo,
 		       int width, int height)
@@ -963,6 +977,90 @@ has_user_backlight_override(xf86OutputPtr output)
 	return strdup(str);
 }
 
+static int get_device_minor(int fd)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) || !S_ISCHR(st.st_mode))
+		return -1;
+
+	return st.st_rdev & 0x63;
+}
+
+static const char * const sysfs_connector_types[] = {
+	/* DRM_MODE_CONNECTOR_Unknown */	"Unknown",
+	/* DRM_MODE_CONNECTOR_VGA */		"VGA",
+	/* DRM_MODE_CONNECTOR_DVII */		"DVI-I",
+	/* DRM_MODE_CONNECTOR_DVID */		"DVI-D",
+	/* DRM_MODE_CONNECTOR_DVIA */		"DVI-A",
+	/* DRM_MODE_CONNECTOR_Composite */	"Composite",
+	/* DRM_MODE_CONNECTOR_SVIDEO */		"SVIDEO",
+	/* DRM_MODE_CONNECTOR_LVDS */		"LVDS",
+	/* DRM_MODE_CONNECTOR_Component */	"Component",
+	/* DRM_MODE_CONNECTOR_9PinDIN */	"DIN",
+	/* DRM_MODE_CONNECTOR_DisplayPort */	"DP",
+	/* DRM_MODE_CONNECTOR_HDMIA */		"HDMI-A",
+	/* DRM_MODE_CONNECTOR_HDMIB */		"HDMI-B",
+	/* DRM_MODE_CONNECTOR_TV */		"TV",
+	/* DRM_MODE_CONNECTOR_eDP */		"eDP",
+	/* DRM_MODE_CONNECTOR_VIRTUAL */	"Virtual",
+	/* DRM_MODE_CONNECTOR_DSI */		"DSI",
+	/* DRM_MODE_CONNECTOR_DPI */		"DPI"
+};
+
+static char *has_connector_backlight(xf86OutputPtr output)
+{
+	struct sna_output *sna_output = output->driver_private;
+	struct sna *sna = to_sna(output->scrn);
+	char path[1024];
+	DIR *dir;
+	struct dirent *de;
+	int minor, len;
+	char *str = NULL;
+
+	if (sna_output->connector_type >= ARRAY_SIZE(sysfs_connector_types))
+		return NULL;
+
+	minor = get_device_minor(sna->kgem.fd);
+	if (minor < 0)
+		return NULL;
+
+	len = snprintf(path, sizeof(path),
+		       "/sys/class/drm/card%d-%s-%d",
+		       minor,
+		       sysfs_connector_types[sna_output->connector_type],
+		       sna_output->connector_type_id);
+	DBG(("%s: lookup %s\n", __FUNCTION__, path));
+
+	dir = opendir(path);
+	while ((de = readdir(dir))) {
+		struct stat st;
+
+		if (*de->d_name == '.')
+			continue;
+
+		snprintf(path + len, sizeof(path) - len,
+			 "/%s", de->d_name);
+
+		if (stat(path, &st))
+			continue;
+
+		if (!S_ISDIR(st.st_mode))
+			continue;
+
+		DBG(("%s: testing %s as backlight\n",
+		     __FUNCTION__, de->d_name));
+
+		if (backlight_exists(de->d_name)) {
+			str = strdup(de->d_name); /* leak! */
+			break;
+		}
+	}
+
+	closedir(dir);
+	return str;
+}
+
 static void
 sna_output_backlight_init(xf86OutputPtr output)
 {
@@ -975,10 +1073,19 @@ sna_output_backlight_init(xf86OutputPtr output)
 	return;
 #endif
 
-	from = X_CONFIG;
-	best_iface = has_user_backlight_override(output);
+	if (sna_output->is_panel) {
+		from = X_CONFIG;
+		best_iface = has_user_backlight_override(output);
+		if (best_iface)
+			goto done;
+	}
+
+	best_iface = has_connector_backlight(output);
 	if (best_iface)
 		goto done;
+
+	if (!sna_output->is_panel)
+		return;
 
 	/* XXX detect right backlight for multi-GPU/panels */
 	from = X_PROBED;
@@ -3548,6 +3655,7 @@ sna_output_detect(xf86OutputPtr output)
 	DBG(("%s(%s): found %d modes, connection status=%d\n",
 	     __FUNCTION__, output->name, sna_output->num_modes, compat_conn.conn.connection));
 
+	sna_output->reprobe = false;
 	sna_output->last_detect = now;
 	switch (compat_conn.conn.connection) {
 	case DRM_MODE_CONNECTED:
@@ -3969,7 +4077,7 @@ sna_output_get_modes(xf86OutputPtr output)
 	sna_output_attach_tile(output);
 
 	current = NULL;
-	if (output->crtc) {
+	if (output->crtc && !sna_output->hotplug_count) {
 		struct drm_mode_crtc mode;
 
 		VG_CLEAR(mode);
@@ -4123,7 +4231,7 @@ __sna_output_dpms(xf86OutputPtr output, int dpms, int fixup)
 					dpms)) {
 		DBG(("%s(%s:%d): failed to set DPMS to %d (fixup? %d)\n",
 		     __FUNCTION__, output->name, sna_output->id, dpms, fixup));
-		if (fixup) {
+		if (fixup && dpms != DPMSModeOn) {
 			sna_crtc_disable(output->crtc, false);
 			return;
 		}
@@ -4475,7 +4583,8 @@ static const char * const output_names[] = {
 	/* DRM_MODE_CONNECTOR_TV */		"TV",
 	/* DRM_MODE_CONNECTOR_eDP */		"eDP",
 	/* DRM_MODE_CONNECTOR_VIRTUAL */	"Virtual",
-	/* DRM_MODE_CONNECTOR_DSI */		"DSI"
+	/* DRM_MODE_CONNECTOR_DSI */		"DSI",
+	/* DRM_MODE_CONNECTOR_DPI */		"DPI"
 };
 
 static bool
@@ -4899,6 +5008,8 @@ sna_output_add(struct sna *sna, unsigned id, unsigned serial)
 	if (!sna_output)
 		return -1;
 
+	sna_output->connector_type = compat_conn.conn.connector_type;
+	sna_output->connector_type_id = compat_conn.conn.connector_type_id;
 	sna_output->num_props = compat_conn.conn.count_props;
 	sna_output->prop_ids = malloc(sizeof(uint32_t)*compat_conn.conn.count_props);
 	sna_output->prop_values = malloc(sizeof(uint64_t)*compat_conn.conn.count_props);
@@ -5028,8 +5139,7 @@ reset:
 	sna_output->base = output;
 
 	backlight_init(&sna_output->backlight);
-	if (sna_output->is_panel)
-		sna_output_backlight_init(output);
+	sna_output_backlight_init(output);
 
 	output->possible_crtcs = possible_crtcs & count_to_mask(sna->mode.num_real_crtc);
 	output->interlaceAllowed = TRUE;
@@ -5147,6 +5257,22 @@ static bool disable_unused_crtc(struct sna *sna)
 	return update;
 }
 
+bool sna_mode_find_hotplug_connector(struct sna *sna, unsigned id)
+{
+	xf86CrtcConfigPtr config = XF86_CRTC_CONFIG_PTR(sna->scrn);
+	int i;
+
+	for (i = 0; i < sna->mode.num_real_output; i++) {
+		struct sna_output *output = to_sna_output(config->output[i]);
+		if (output->id == id) {
+			output->reprobe = true;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static bool
 output_check_status(struct sna *sna, struct sna_output *output)
 {
@@ -5155,6 +5281,9 @@ output_check_status(struct sna *sna, struct sna_output *output)
 	struct drm_mode_get_blob blob;
 	xf86OutputStatus status;
 	char *edid;
+
+	if (output->reprobe)
+		return false;
 
 	VG_CLEAR(compat_conn);
 
@@ -5237,7 +5366,7 @@ void sna_mode_discover(struct sna *sna, bool tell)
 	     res.count_connectors, sna->mode.num_real_output,
 	     res.count_encoders, res.count_crtcs));
 	if (res.count_connectors > 32)
-		return;
+		res.count_connectors = 32;
 
 	assert(sna->mode.num_real_crtc == res.count_crtcs || is_zaphod(sna->scrn));
 	assert(sna->mode.max_crtc_width  == res.max_width);
@@ -5281,6 +5410,7 @@ void sna_mode_discover(struct sna *sna, bool tell)
 			} else {
 				DBG(("%s: output %s (id=%d), changed state, reprobing\n",
 				     __FUNCTION__, output->name, sna_output->id));
+				sna_output->hotplug_count++;
 				sna_output->last_detect = 0;
 				changed |= 4;
 			}
@@ -6686,6 +6816,7 @@ sna_page_flip(struct sna *sna,
 		assert(crtc->bo->refcnt >= crtc->bo->active_scanout);
 		assert(crtc->flip_bo == NULL);
 
+		assert_crtc_fb(sna, crtc);
 		if (data == NULL && crtc->bo == bo)
 			goto next_crtc;
 
@@ -8858,6 +8989,7 @@ void sna_mode_redisplay(struct sna *sna)
 				sna_crtc_redisplay(crtc, &damage, bo);
 				kgem_bo_submit(&sna->kgem, bo);
 
+				assert_crtc_fb(sna, sna_crtc);
 				arg.crtc_id = __sna_crtc_id(sna_crtc);
 				arg.fb_id = get_fb(sna, bo,
 						   crtc->mode.HDisplay,
@@ -8975,6 +9107,7 @@ disable1:
 
 			assert(config->crtc[i]->enabled);
 			assert(crtc->flip_bo == NULL);
+			assert_crtc_fb(sna, crtc);
 
 			arg.crtc_id = __sna_crtc_id(crtc);
 			arg.user_data = (uintptr_t)crtc;
@@ -9190,14 +9323,6 @@ again:
 					assert(crtc->bo->active_scanout);
 					assert(crtc->bo->refcnt >= crtc->bo->active_scanout);
 
-#ifndef NDEBUG
-					{
-						struct drm_mode_crtc mode = { .crtc_id = __sna_crtc_id(crtc) };
-						drmIoctl(sna->kgem.fd, DRM_IOCTL_MODE_GETCRTC, &mode);
-						assert(mode.fb_id == fb_id(crtc->flip_bo));
-					}
-#endif
-
 					crtc->bo->active_scanout--;
 					kgem_bo_destroy(&sna->kgem, crtc->bo);
 
@@ -9208,6 +9333,8 @@ again:
 
 					crtc->bo = crtc->flip_bo;
 					crtc->flip_bo = NULL;
+
+					assert_crtc_fb(sna, crtc);
 				} else {
 					crtc->flip_bo->active_scanout--;
 					kgem_bo_destroy(&sna->kgem, crtc->flip_bo);
