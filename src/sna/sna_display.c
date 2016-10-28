@@ -257,6 +257,8 @@ struct sna_output {
 	int connector_type;
 	int connector_type_id;
 
+	uint32_t link_status_idx;
+
 	uint32_t edid_idx;
 	uint32_t edid_blob_id;
 	uint32_t edid_len;
@@ -311,6 +313,8 @@ enum { /* XXX copied from hw/xfree86/modes/xf86Crtc.c */
 
 static void __sna_output_dpms(xf86OutputPtr output, int dpms, int fixup);
 static void sna_crtc_disable_cursor(struct sna *sna, struct sna_crtc *crtc);
+static bool sna_crtc_flip(struct sna *sna, struct sna_crtc *crtc,
+			  struct kgem_bo *bo, int x, int y);
 
 static bool is_zaphod(ScrnInfoPtr scrn)
 {
@@ -5113,6 +5117,8 @@ reset:
 	sna_output->id = compat_conn.conn.connector_id;
 	sna_output->is_panel = is_panel(compat_conn.conn.connector_type);
 	sna_output->edid_idx = find_property(sna, sna_output, "EDID");
+	sna_output->link_status_idx =
+		find_property(sna, sna_output, "link-status");
 	if (find_property(sna, sna_output, "scaling mode") != -1)
 		sna_output->add_default_modes =
 			xf86ReturnOptValBool(output->options, OPTION_DEFAULT_MODES, TRUE);
@@ -5274,6 +5280,30 @@ bool sna_mode_find_hotplug_connector(struct sna *sna, unsigned id)
 }
 
 static bool
+output_check_link(struct sna *sna, struct sna_output *output)
+{
+	struct sna_crtc *crtc;
+	uint64_t link_status;
+	int crtc_x, crtc_y;
+
+	if (!output->base->crtc)
+		return true;
+
+	if (output->link_status_idx == -1)
+		return true;
+
+#define LINK_STATUS_GOOD 0
+	link_status = output->prop_values[output->link_status_idx];
+	if (link_status == LINK_STATUS_GOOD)
+		return true;
+
+	crtc = to_sna_crtc(output->base->crtc);
+	crtc_x = crtc->offset & 0xffff;
+	crtc_y = crtc->offset >> 16;
+	return sna_crtc_flip(sna, crtc, crtc->bo, crtc_x, crtc_y);
+}
+
+static bool
 output_check_status(struct sna *sna, struct sna_output *output)
 {
 	union compat_mode_get_connector compat_conn;
@@ -5281,9 +5311,6 @@ output_check_status(struct sna *sna, struct sna_output *output)
 	struct drm_mode_get_blob blob;
 	xf86OutputStatus status;
 	char *edid;
-
-	if (output->reprobe)
-		return false;
 
 	VG_CLEAR(compat_conn);
 
@@ -5300,6 +5327,12 @@ output_check_status(struct sna *sna, struct sna_output *output)
 		     DRM_IOCTL_MODE_GETCONNECTOR,
 		     &compat_conn.conn) == 0)
 		output->update_properties = false;
+
+	if (!output_check_link(sna, output))
+		return false;
+
+	if (output->reprobe)
+		return false;
 
 	switch (compat_conn.conn.connection) {
 	case DRM_MODE_CONNECTED:
